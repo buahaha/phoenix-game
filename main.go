@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/url"
@@ -23,8 +23,6 @@ func main() {
 	u := url.URL{Scheme: "ws", Host: *addr, Path: "/ws"}
 	log.Printf("connecting to %s", u.String())
 
-	done := make(chan struct{})
-
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	ticker2 := time.NewTicker(100 * time.Millisecond)
@@ -42,63 +40,68 @@ func main() {
 		log.Fatal("dial:", err)
 	}
 
-	tria2 := make(chan []float32)
-	vao := makeVao(randTriangle())
-	vaos := []uint32{}
-	vertices := [][]float32{}
+	tria2 := make(chan Triangle)
+	vertices := []Triangle{}
+	vertices = append(vertices, points)
+	vaos := makeVao(vertices)
+	newObject := false
+
+	draw(vaos, window, program)
+	go func() {
+		for range ticker2.C {
+			readMessage(c, tria2)
+		}
+	}()
+	go func() {
+		for range ticker.C {
+			sendJSON(c, points)
+		}
+	}()
+	go func() {
+		for tri := range tria2 {
+			dup := false
+			for _, v := range vertices {
+				if Equal(v, tri) {
+					dup = true
+				}
+			}
+			if !dup && len(tri) > 0 {
+				vertices = append(vertices, tri)
+				newObject = true
+			}
+		}
+	}()
+
 	for !window.ShouldClose() {
 		if window.GetKey(glfw.KeyEscape) == glfw.Press {
 			window.SetShouldClose(true)
 		}
-		go draw(vaos, window, program)
-		go func() {
-			select {
-			case _ = <-ticker.C:
-				go sendJSON(done, c, points)
-			}
-		}()
-		go func() {
-			select {
-			case _ = <-ticker2.C:
-				go readMessage(done, c, tria2)
-			}
-		}()
-		var tri []float32
-		tri = <-tria2
-		dup := false
-		for _, v := range vertices {
-			if Equal(v, tri) {
-				dup = true
-			}
+		if newObject {
+			vaos = makeVao(vertices)
+			newObject = false
 		}
-		if !dup {
-			vertices = append(vertices, tri)
-			vao = makeVao(tri)
-			vaos = append(vaos, vao)
-		}
-
+		draw(vaos, window, program)
 	}
-	c.Close()
+	defer c.Close()
 }
 
-func readMessage(done chan struct{}, c *websocket.Conn, trian2 chan []float32) {
-	_, tri, err := c.ReadMessage()
+func readMessage(c *websocket.Conn, trian2 chan Triangle) {
+	triangle := Triangle{}
+	err := c.ReadJSON(&triangle)
 	if err != nil {
-		log.Println("read:", err)
+		log.Fatalln("read:", err)
 		return
 	}
-	log.Printf("recv: %s", tri)
-	triangle := []float32{}
-	json.Unmarshal(tri, &triangle)
+	log.Printf("recv: %f", triangle)
 	if len(triangle) > 0 {
 		trian2 <- triangle
 	}
 }
 
-func sendJSON(done chan struct{}, c *websocket.Conn, points Triangle) {
+func sendJSON(c *websocket.Conn, points Triangle) {
 	err := c.WriteJSON(points)
 	if err != nil {
-		log.Println("write:", err)
+		log.Fatalln("write:", err)
 		return
 	}
 }
@@ -115,7 +118,7 @@ func randomizeVertex() float32 {
 
 // Equal tells whether a and b contain the same elements.
 // A nil argument is equivalent to an empty slice.
-func Equal(a, b []float32) bool {
+func Equal(a, b Triangle) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -130,9 +133,9 @@ func Equal(a, b []float32) bool {
 type Triangle []float32
 
 var triangleVertexArray []float32 = []float32{
-	0, 0, 0,
-	0, 0, 0,
-	0, 0, 0,
+	0, 0, 0, //0, 0, 0,
+	0, 0, 0, //0, 0, 0,
+	0, 0, 0, //0, 0, 0,
 }
 
 func randTriangle() Triangle {
@@ -142,65 +145,77 @@ func randTriangle() Triangle {
 	vertextLeft1, veretxLeft2 := randomizeVertex(), randomizeVertex()
 	vertextRight1, veretxRight2 := randomizeVertex(), randomizeVertex()
 	shape := Triangle{
-		vertexTop1, veretxTop2, 0,
-		vertextLeft1, veretxLeft2, 0,
-		vertextRight1, veretxRight2, 0,
+		vertexTop1, veretxTop2, 0, 1, 0, 0,
+		vertextLeft1, veretxLeft2, 0, 0, 1, 0,
+		vertextRight1, veretxRight2, 0, 0, 0, 1,
 	}
 	return shape
 }
-
-var vertexShaderSource = `
-    #version 410
-    in vec3 vp;
-    void main() {
-        gl_Position = vec4(vp, 1.0);
-    }
-` + "\x00"
-
-var fragmentShaderSource = `
-	#version 410
-	uniform vec3 triangleColor;
-    out vec4 frag_colour;
-    void main() {
-        frag_colour = vec4(triangleColor, 1);
-    }
-` + "\x00"
 
 func randTriangleColor() float32 {
 	rand.Seed(time.Now().UnixNano())
 	return rand.Float32()
 }
 
+func normalize(val int, max float32, min float32) float32 {
+	return (float32(val) - min) / (max - min)
+}
+
 // makeVao initializes and returns a vertex array from the points provided.
-func makeVao(points []float32) uint32 {
+func makeVao(vertices []Triangle) []uint32 {
+	var vaos []uint32
 	var vbo uint32
-	gl.GenBuffers(1, &vbo)
-	gl.BindBuffer(gl.ARRAY_BUFFER, vbo)
-	gl.BufferData(gl.ARRAY_BUFFER, 8*len(points), gl.Ptr(points), gl.STATIC_DRAW)
+	for _, vert := range vertices {
+		var vertice []float32
+		for _, v := range vert {
+			vertice = append(vert, v)
+		}
+		log.Println(vertice)
+		gl.GenBuffers(1, &vbo)
+		gl.BindBuffer(gl.ARRAY_BUFFER, vbo)
+		gl.BufferData(gl.ARRAY_BUFFER, 8*len(vertice), gl.Ptr(vertice), gl.DYNAMIC_DRAW)
 
-	var vao uint32
-	gl.GenVertexArrays(1, &vao)
-	gl.BindVertexArray(vao)
-	gl.EnableVertexAttribArray(0)
-	gl.BindBuffer(gl.ARRAY_BUFFER, vbo)
-	gl.VertexAttribPointer(0, 3, gl.FLOAT, false, 0, nil)
+		var vao uint32
+		gl.GenVertexArrays(1, &vao)
+		gl.BindVertexArray(vao)
+		// gl.EnableVertexAttribArray(0)
+		gl.VertexAttribPointer(0, 3, gl.FLOAT, false,
+			6*4, gl.PtrOffset(0))
+		gl.EnableVertexAttribArray(0)
 
-	return vao
+		gl.VertexAttribPointer(1, 3, gl.FLOAT, false,
+			6*4, gl.PtrOffset(3*4))
+		gl.EnableVertexAttribArray(1)
+		gl.BindBuffer(gl.ARRAY_BUFFER, vbo)
+		// gl.VertexAttribPointer(0, 3, gl.FLOAT, false, 0, nil)
+
+		vaos = append(vaos, vao)
+		gl.BindVertexArray(0)
+	}
+
+	return vaos
 }
 
 func draw(vaos []uint32, window *glfw.Window, program uint32) {
+
+	gl.ClearColor(0.1, 0.1, 0.1, 1.0)
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 	gl.UseProgram(program)
 
-	fmt.Println("vaos:", len(vaos))
 	for _, vao := range vaos {
 		gl.BindVertexArray(vao)
+
 		// len(triangle) 9 vertices / 3
 		gl.DrawArrays(gl.TRIANGLES, 0, int32(len(triangleVertexArray)/3))
+		gl.BindVertexArray(0)
 	}
 
-	triangleColor := gl.GetUniformLocation(program, gl.Str("triangleColor\x00"))
-	gl.Uniform3f(triangleColor, randTriangleColor(), randTriangleColor(), randTriangleColor())
+	// my lasers
+	// color := normalize(time.Now().Nanosecond(), 999999999, 0)
+	// myColor := float32(math.Asin(float64(color)))
+	// myRevColor := float32(math.Cos((float64(color))))
+	// triangleColor := gl.GetUniformLocation(program, gl.Str("triangleColor\x00"))
+	// gl.Uniform3f(triangleColor, myColor, myRevColor, myRevColor)
 
 	glfw.PollEvents()
 	window.SwapBuffers()
@@ -217,6 +232,8 @@ func initGlfw() *glfw.Window {
 	glfw.WindowHint(glfw.ContextVersionMinor, 1)
 	glfw.WindowHint(glfw.OpenGLProfile, glfw.OpenGLCoreProfile)
 	glfw.WindowHint(glfw.OpenGLForwardCompatible, glfw.True)
+
+	glfw.WindowHint(glfw.Samples, 8)
 
 	x := glfw.GetPrimaryMonitor().GetVideoMode().Width
 	y := glfw.GetPrimaryMonitor().GetVideoMode().Height
@@ -239,11 +256,19 @@ func initOpenGL() uint32 {
 	version := gl.GoStr(gl.GetString(gl.VERSION))
 	log.Println("OpenGL version", version)
 
-	vertexShader, err := compileShader(vertexShaderSource, gl.VERTEX_SHADER)
+	vertexShaderSource, err := ioutil.ReadFile("vertexShader.glsl")
 	if err != nil {
 		panic(err)
 	}
-	fragmentShader, err := compileShader(fragmentShaderSource, gl.FRAGMENT_SHADER)
+	vertexShader, err := compileShader(string(vertexShaderSource)+"\x00", gl.VERTEX_SHADER)
+	if err != nil {
+		panic(err)
+	}
+	fragmentShaderSource, err := ioutil.ReadFile("fragmentShader.glsl")
+	if err != nil {
+		panic(err)
+	}
+	fragmentShader, err := compileShader(string(fragmentShaderSource)+"\x00", gl.FRAGMENT_SHADER)
 	if err != nil {
 		panic(err)
 	}
