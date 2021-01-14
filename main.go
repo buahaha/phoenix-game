@@ -237,8 +237,8 @@ func initGlfw() *glfw.Window {
 
 	x := glfw.GetPrimaryMonitor().GetVideoMode().Width
 	y := glfw.GetPrimaryMonitor().GetVideoMode().Height
-	x = 640
-	y = 480
+	x = 320
+	y = 240
 	window, err := glfw.CreateWindow(x, y, "Phoenix", nil, nil)
 	if err != nil {
 		panic(err)
